@@ -1680,7 +1680,6 @@ CPP_template_def(size_t NUM_GROUP_COLUMNS, typename BlockIterator,
         HashMapAggregationData<NUM_GROUP_COLUMNS>& aggregationData,
         HashMapTimers& timers, BlockIterator blockIt, BlocksEnd blocksEnd,
         IdTable restTable) const {
-  const size_t inWidth = _subtree->getResultWidth();
   LocalVocab& localVocab = data.localVocabRef_.value();
 
   // Detailed timing for hybrid fallback steps
@@ -1720,17 +1719,14 @@ CPP_template_def(size_t NUM_GROUP_COLUMNS, typename BlockIterator,
     bufferingTimer.stop();
   }
 
-  // perform sort-based grouping on buffered new groups
+  // Sort and group the buffered remainder using external sort per bucket.
   restSortTimer.cont();
-  Engine::sort(restTable, data.columnIndices_.value());
-  restSortTimer.stop();
-
   restGroupByTimer.cont();
-  IdTable restResult = CALL_FIXED_SIZE((std::array{inWidth, getResultWidth()}),
-                                       &GroupByImpl::doGroupBy, this, restTable,
-                                       data.columnIndices_.value(),
-                                       data.aggregates_.value(), &localVocab);
+  IdTable restResult =
+      externalSortRemainder(restTable, data.columnIndices_.value(),
+                            data.aggregates_.value(), localVocab);
   restGroupByTimer.stop();
+  restSortTimer.stop();
 
   hashResultTimer.cont();
   IdTable hashResult = createResultFromHashMap(
@@ -1765,6 +1761,93 @@ CPP_template_def(size_t NUM_GROUP_COLUMNS, typename BlockIterator,
                    ", sorted tail groups=", restResult.numRows()));
 
   return Result{std::move(hashResult), resultSortedOn(), std::move(localVocab)};
+}
+
+// _____________________________________________________________________________
+// Externally sort the remainder rows in hash buckets and group them to reduce
+// memory pressure while preserving group boundaries.
+IdTable GroupByImpl::externalSortRemainder(
+    const IdTable& restTable, const std::vector<size_t>& groupByCols,
+    const std::vector<Aggregate>& aggregates, LocalVocab& localVocab) const {
+  // If restTable is empty, return empty result early
+  if (restTable.empty()) {
+    return IdTable{getResultWidth(), getExecutionContext()->getAllocator()};
+  }
+
+  constexpr size_t kNumBuckets = 16;
+  using ad_utility::memory_literals::operator""_MB;
+  const ad_utility::MemorySize kSorterMemPerBucket = 8_MB;
+
+  auto rowLessByGroupCols = [&groupByCols](const auto& a, const auto& b) {
+    for (size_t c : groupByCols) {
+      const auto& av = a[c];
+      const auto& bv = b[c];
+      if (av != bv) return av < bv;
+    }
+    return false;
+  };
+
+  auto hashGroupKey = [&groupByCols](const IdTable& t, size_t row) -> uint64_t {
+    uint64_t h = 1469598103934665603ull;
+    constexpr uint64_t p = 1099511628211ull;
+    for (size_t c : groupByCols) {
+      uint64_t x = t(row, c).getBits();
+      h ^= x;
+      h *= p;
+    }
+    return h;
+  };
+  auto bucketOf = [](uint64_t h) -> size_t { return h & (kNumBuckets - 1); };
+
+  using Sorter =
+      ad_utility::CompressedExternalIdTableSorter<decltype(rowLessByGroupCols),
+                                                  0>;
+  std::array<std::unique_ptr<Sorter>, kNumBuckets> sorters;
+  const size_t inWidth = restTable.numColumns();
+  for (size_t b = 0; b < kNumBuckets; ++b) {
+    std::string filename = absl::StrCat("groupby-external-bucket-", b, ".dat");
+    sorters[b] = std::make_unique<Sorter>(
+        filename, inWidth, kSorterMemPerBucket,
+        getExecutionContext()->getAllocator(),
+        ad_utility::DEFAULT_BLOCKSIZE_EXTERNAL_ID_TABLE, rowLessByGroupCols);
+  }
+
+  for (size_t r = 0; r < restTable.size(); ++r) {
+    auto h = hashGroupKey(restTable, r);
+    size_t b = bucketOf(h);
+    sorters[b]->push(restTable[r]);
+  }
+
+  std::vector<IdTable> bucketResults;
+  bucketResults.reserve(kNumBuckets);
+
+  // For each bucket, sort and group its rows using standard doGroupBy
+  size_t outWidth = getResultWidth();
+  for (auto& sPtr : sorters) {
+    if (sPtr->size() == 0) {
+      continue;
+    }
+
+    // Collect all sorted rows from this bucket into one table
+    IdTable bucketTable{inWidth, getExecutionContext()->getAllocator()};
+    for (auto& block : sPtr->template getSortedBlocks<0>()) {
+      bucketTable.insertAtEnd(block);
+    }
+
+    // Group the sorted bucket table using doGroupBy
+    IdTable grouped = CALL_FIXED_SIZE(
+        (std::array{inWidth, outWidth}), &GroupByImpl::doGroupBy, this,
+        bucketTable, groupByCols, aggregates, &localVocab);
+
+    bucketResults.push_back(std::move(grouped));
+  }
+
+  // Merge all bucket results
+  IdTable finalOut{getResultWidth(), getExecutionContext()->getAllocator()};
+  for (const auto& br : bucketResults) {
+    finalOut.insertAtEnd(br);
+  }
+  return finalOut;
 }
 
 // Helper to build column-wise spans of grouping values for a block

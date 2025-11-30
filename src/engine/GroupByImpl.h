@@ -742,6 +742,24 @@ class GroupByImpl : public Operation {
           HashMapAggregationData<NUM_GROUP_COLUMNS>& aggregationData,
           HashMapTimers& timers, BlockIterator blockIt, BlocksEnd blocksEnd,
           IdTable restTable) const;
+
+  /** Externally sort the remainder rows in hash buckets and group them.
+   *
+   * This function buckets the rows in `restTable` by FNV-1a hash of the group
+   * key, sorts each bucket using an external sorter, and then aggregates each
+   * bucket's sorted result into groups via LazyGroupBy. Finally it merges all
+   * bucket results into a single IdTable.
+   *
+   * @param restTable The buffered rows that would create new groups.
+   * @param groupByCols The column indices that form the group key.
+   * @param aggregates The aggregation expressions.
+   * @param localVocab The local vocabulary to use and extend during processing.
+   * @return An IdTable containing the grouped results from the remainder.
+   */
+  IdTable externalSortRemainder(const IdTable& restTable,
+                                const std::vector<size_t>& groupByCols,
+                                const std::vector<Aggregate>& aggregates,
+                                LocalVocab& localVocab) const;
 };
 
 // _____________________________________________________________________________
